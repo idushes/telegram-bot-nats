@@ -297,7 +297,17 @@ func handleOutgoing(bot Bot, msg *nats.Msg) {
 		return
 	}
 
-	log.Printf("[%s] → %s OK", bot.Name, apiMethod)
+	// Check Telegram API response for errors
+	var apiResp struct {
+		OK          bool   `json:"ok"`
+		ErrorCode   int    `json:"error_code,omitempty"`
+		Description string `json:"description,omitempty"`
+	}
+	if err := json.Unmarshal(result, &apiResp); err == nil && !apiResp.OK {
+		log.Printf("[%s] → %s FAIL [%d] %s", bot.Name, apiMethod, apiResp.ErrorCode, apiResp.Description)
+	} else {
+		log.Printf("[%s] → %s OK", bot.Name, apiMethod)
+	}
 
 	// Reply if request/reply pattern
 	if msg.Reply != "" {
