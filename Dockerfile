@@ -26,4 +26,6 @@ RUN apk --no-cache add ca-certificates tzdata
 # Copy the binary from builder
 COPY --from=builder /app/telegram-bot-nats .
 
+EXPOSE 8080
+
 CMD ["./telegram-bot-nats"]

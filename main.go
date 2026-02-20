@@ -43,6 +43,15 @@ func main() {
 	_ = godotenv.Load()
 
 	natsURL := env("NATS_URL", "nats://localhost:4222")
+	webhookBase := os.Getenv("WEBHOOK_BASE_URL")
+	port := env("PORT", "8080")
+	secret := os.Getenv("WEBHOOK_SECRET")
+
+	if webhookBase == "" {
+		log.Fatal("WEBHOOK_BASE_URL is required")
+	}
+	// Remove trailing slash
+	webhookBase = strings.TrimRight(webhookBase, "/")
 
 	// Discover bots from BOT_* env vars
 	bots := discoverBots()
@@ -50,7 +59,7 @@ func main() {
 		log.Fatal("No bots configured. Set BOT_<NAME>=<token> environment variables.")
 	}
 
-	log.Printf("Starting telegram-bot-nats | NATS: %s | Bots: %d", natsURL, len(bots))
+	log.Printf("Starting telegram-bot-nats (webhook) | NATS: %s | Bots: %d", natsURL, len(bots))
 
 	// NATS connect
 	nc, err := nats.Connect(natsURL)
@@ -59,10 +68,9 @@ func main() {
 	}
 	defer nc.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Build bot lookup map for webhook handler
+	botMap := make(map[string]Bot, len(bots))
 
-	// Start each bot
 	for _, bot := range bots {
 		b := bot
 		log.Printf("[%s] starting bot", b.Name)
@@ -77,9 +85,38 @@ func main() {
 		}
 		log.Printf("[%s] subscribed to %s", b.Name, subject)
 
-		// Start long-polling goroutine
-		go pollUpdates(ctx, nc, b)
+		// Set webhook at Telegram
+		webhookURL := fmt.Sprintf("%s/webhook/%s", webhookBase, b.Name)
+		if err := setWebhook(b, webhookURL, secret); err != nil {
+			log.Fatalf("[%s] setWebhook: %v", b.Name, err)
+		}
+		log.Printf("[%s] webhook set: %s", b.Name, webhookURL)
+
+		botMap[b.Name] = b
 	}
+
+	// HTTP server
+	mux := http.NewServeMux()
+	mux.HandleFunc("/webhook/", makeWebhookHandler(nc, botMap, secret))
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      mux,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
+	// Start HTTP server
+	go func() {
+		log.Printf("HTTP server listening on :%s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("HTTP server: %v", err)
+		}
+	}()
 
 	// Graceful shutdown
 	sig := make(chan os.Signal, 1)
@@ -87,7 +124,21 @@ func main() {
 	<-sig
 
 	log.Println("Shutting down...")
-	cancel()
+
+	// Delete webhooks so polling works again in dev
+	for _, b := range bots {
+		if err := deleteWebhook(b); err != nil {
+			log.Printf("[%s] deleteWebhook: %v", b.Name, err)
+		} else {
+			log.Printf("[%s] webhook deleted", b.Name)
+		}
+	}
+
+	// Shutdown HTTP server
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutCancel()
+	srv.Shutdown(shutCtx)
+
 	nc.Drain()
 	log.Println("Done.")
 }
@@ -110,56 +161,73 @@ func discoverBots() []Bot {
 	return bots
 }
 
-// pollUpdates performs Telegram long-polling and publishes updates to NATS.
-func pollUpdates(ctx context.Context, nc *nats.Conn, bot Bot) {
-	offset := 0
-	client := &http.Client{Timeout: 35 * time.Second}
-	baseURL := fmt.Sprintf("https://api.telegram.org/bot%s", bot.Token)
-
-	for {
-		select {
-		case <-ctx.Done():
+// makeWebhookHandler returns an HTTP handler for Telegram webhook updates.
+func makeWebhookHandler(nc *nats.Conn, botMap map[string]Bot, secret string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
-		default:
 		}
 
-		url := fmt.Sprintf("%s/getUpdates?offset=%d&timeout=30", baseURL, offset)
-		resp, err := client.Get(url)
+		// Extract bot name from path: /webhook/<name>
+		name := strings.TrimPrefix(r.URL.Path, "/webhook/")
+		if name == "" {
+			http.Error(w, "missing bot name", http.StatusBadRequest)
+			return
+		}
+
+		bot, ok := botMap[name]
+		if !ok {
+			http.Error(w, "unknown bot", http.StatusNotFound)
+			return
+		}
+
+		// Verify secret token
+		if secret != "" {
+			token := r.Header.Get("X-Telegram-Bot-Api-Secret-Token")
+			if token != secret {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			log.Printf("[%s] poll error: %v", bot.Name, err)
-			time.Sleep(3 * time.Second)
-			continue
+			http.Error(w, "read body", http.StatusBadRequest)
+			return
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			log.Printf("[%s] read body: %v", bot.Name, err)
-			time.Sleep(3 * time.Second)
-			continue
+		var upd Update
+		if err := json.Unmarshal(body, &upd); err != nil {
+			http.Error(w, "bad json", http.StatusBadRequest)
+			return
 		}
 
-		var result struct {
-			OK     bool     `json:"ok"`
-			Result []Update `json:"result"`
-		}
-		if err := json.Unmarshal(body, &result); err != nil {
-			log.Printf("[%s] unmarshal: %v", bot.Name, err)
-			time.Sleep(3 * time.Second)
-			continue
-		}
+		publishUpdate(nc, bot, upd)
 
-		if !result.OK {
-			log.Printf("[%s] API returned ok=false: %s", bot.Name, string(body))
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		for _, upd := range result.Result {
-			offset = upd.UpdateID + 1
-			publishUpdate(nc, bot, upd)
-		}
+		w.WriteHeader(http.StatusOK)
 	}
+}
+
+// setWebhook registers the webhook URL at Telegram for a bot.
+func setWebhook(bot Bot, webhookURL, secret string) error {
+	params := map[string]interface{}{
+		"url":             webhookURL,
+		"allowed_updates": []string{"message", "edited_message", "callback_query", "inline_query"},
+	}
+	if secret != "" {
+		params["secret_token"] = secret
+	}
+
+	payload, _ := json.Marshal(params)
+	_, err := callTelegramAPI(bot.Token, "setWebhook", payload)
+	return err
+}
+
+// deleteWebhook removes the webhook at Telegram for a bot.
+func deleteWebhook(bot Bot) error {
+	_, err := callTelegramAPI(bot.Token, "deleteWebhook", []byte(`{}`))
+	return err
 }
 
 // publishUpdate publishes a Telegram update to NATS subjects.
