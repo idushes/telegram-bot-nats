@@ -46,6 +46,7 @@ func main() {
 	webhookBase := os.Getenv("WEBHOOK_BASE_URL")
 	port := env("PORT", "8080")
 	secret := os.Getenv("WEBHOOK_SECRET")
+	consumerName := env("CONSUMER_NAME", "connector")
 
 	if webhookBase == "" {
 		log.Fatal("WEBHOOK_BASE_URL is required")
@@ -68,22 +69,17 @@ func main() {
 	}
 	defer nc.Close()
 
+	// JetStream context
+	js, err := nc.JetStream()
+	if err != nil {
+		log.Fatalf("JetStream: %v", err)
+	}
+
 	// Build bot lookup map for webhook handler
 	botMap := make(map[string]Bot, len(bots))
 
 	for _, bot := range bots {
 		b := bot
-		log.Printf("[%s] starting bot", b.Name)
-
-		// Subscribe to outgoing subjects: telegram.<name>.out.>
-		subject := fmt.Sprintf("telegram.%s.out.>", b.Name)
-		_, err := nc.Subscribe(subject, func(msg *nats.Msg) {
-			handleOutgoing(nc, b, msg)
-		})
-		if err != nil {
-			log.Fatalf("[%s] subscribe %s: %v", b.Name, subject, err)
-		}
-		log.Printf("[%s] subscribed to %s", b.Name, subject)
 
 		// Set webhook at Telegram
 		webhookURL := fmt.Sprintf("%s/webhook/%s", webhookBase, b.Name)
@@ -94,6 +90,15 @@ func main() {
 
 		botMap[b.Name] = b
 	}
+
+	// JetStream durable consumer for outgoing commands
+	_, err = js.Subscribe("telegram.*.out.>", func(msg *nats.Msg) {
+		handleOutgoing(nc, botMap, msg)
+	}, nats.Durable(consumerName), nats.AckExplicit())
+	if err != nil {
+		log.Fatalf("JetStream subscribe: %v", err)
+	}
+	log.Printf("JetStream consumer '%s' subscribed to telegram.*.out.>", consumerName)
 
 	// HTTP server
 	mux := http.NewServeMux()
@@ -260,15 +265,26 @@ func publishUpdate(nc *nats.Conn, bot Bot, upd Update) {
 	log.Printf("[%s] ← update %d", bot.Name, upd.UpdateID)
 }
 
-// handleOutgoing handles NATS messages on telegram.<name>.out.* subjects.
-func handleOutgoing(nc *nats.Conn, bot Bot, msg *nats.Msg) {
-	// Extract method from subject: telegram.<name>.out.<method>
+// handleOutgoing handles JetStream messages on telegram.<name>.out.* subjects.
+func handleOutgoing(nc *nats.Conn, botMap map[string]Bot, msg *nats.Msg) {
+	// Extract bot name and method from subject: telegram.<name>.out.<method>
 	parts := strings.Split(msg.Subject, ".")
 	if len(parts) < 4 {
-		log.Printf("[%s] bad out subject: %s", bot.Name, msg.Subject)
+		log.Printf("bad out subject: %s", msg.Subject)
 		respondError(msg, "invalid subject format")
+		msg.Ack()
 		return
 	}
+
+	botName := parts[1]
+	bot, ok := botMap[botName]
+	if !ok {
+		log.Printf("unknown bot in subject: %s", msg.Subject)
+		respondError(msg, "unknown bot")
+		msg.Ack()
+		return
+	}
+
 	method := parts[len(parts)-1]
 
 	var apiMethod string
@@ -280,6 +296,7 @@ func handleOutgoing(nc *nats.Conn, bot Bot, msg *nats.Msg) {
 		if err := json.Unmarshal(msg.Data, &raw); err != nil {
 			log.Printf("[%s] bad raw request: %v", bot.Name, err)
 			respondError(msg, fmt.Sprintf("bad raw request: %v", err))
+			msg.Ack()
 			return
 		}
 		apiMethod = raw.Method
@@ -294,6 +311,7 @@ func handleOutgoing(nc *nats.Conn, bot Bot, msg *nats.Msg) {
 	if err != nil {
 		log.Printf("[%s] API %s error: %v", bot.Name, apiMethod, err)
 		respondError(msg, fmt.Sprintf("API error: %v", err))
+		msg.Nak()
 		return
 	}
 
@@ -325,6 +343,8 @@ func handleOutgoing(nc *nats.Conn, bot Bot, msg *nats.Msg) {
 	if msg.Reply != "" {
 		msg.Respond(result)
 	}
+
+	msg.Ack()
 }
 
 // callTelegramAPI calls a Telegram Bot API method with JSON payload.
