@@ -78,7 +78,7 @@ func main() {
 		// Subscribe to outgoing subjects: telegram.<name>.out.>
 		subject := fmt.Sprintf("telegram.%s.out.>", b.Name)
 		_, err := nc.Subscribe(subject, func(msg *nats.Msg) {
-			handleOutgoing(b, msg)
+			handleOutgoing(nc, b, msg)
 		})
 		if err != nil {
 			log.Fatalf("[%s] subscribe %s: %v", b.Name, subject, err)
@@ -261,7 +261,7 @@ func publishUpdate(nc *nats.Conn, bot Bot, upd Update) {
 }
 
 // handleOutgoing handles NATS messages on telegram.<name>.out.* subjects.
-func handleOutgoing(bot Bot, msg *nats.Msg) {
+func handleOutgoing(nc *nats.Conn, bot Bot, msg *nats.Msg) {
 	// Extract method from subject: telegram.<name>.out.<method>
 	parts := strings.Split(msg.Subject, ".")
 	if len(parts) < 4 {
@@ -305,6 +305,18 @@ func handleOutgoing(bot Bot, msg *nats.Msg) {
 	}
 	if err := json.Unmarshal(result, &apiResp); err == nil && !apiResp.OK {
 		log.Printf("[%s] → %s FAIL [%d] %s", bot.Name, apiMethod, apiResp.ErrorCode, apiResp.Description)
+
+		// Publish error to NATS stream
+		errPayload, _ := json.Marshal(map[string]interface{}{
+			"method":      apiMethod,
+			"error_code":  apiResp.ErrorCode,
+			"description": apiResp.Description,
+			"request":     json.RawMessage(payload),
+		})
+		errSubject := fmt.Sprintf("telegram.%s.error", bot.Name)
+		if pubErr := nc.Publish(errSubject, errPayload); pubErr != nil {
+			log.Printf("[%s] publish error event: %v", bot.Name, pubErr)
+		}
 	} else {
 		log.Printf("[%s] → %s OK", bot.Name, apiMethod)
 	}
